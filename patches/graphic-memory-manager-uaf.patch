@@ -1,0 +1,17 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+--- a/vcl/source/graphic/Manager.cxx
++++ b/vcl/source/graphic/Manager.cxx
+@@ -196,5 +196,10 @@
+
+     for (MemoryManaged* pMemoryManaged : aObjectListCopy)
+     {
++        // The object may have been unregistered and destroyed while the mutex was
++        // unlocked by a previous reduceMemory() call below.
++        if (maObjectList.find(pMemoryManaged) == maObjectList.end())
++            continue;
++
+         if (!pMemoryManaged->canReduceMemory())
+             continue;

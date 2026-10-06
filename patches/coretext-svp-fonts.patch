@@ -1,0 +1,1177 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+--- a/vcl/Library_vcl.mk
++++ b/vcl/Library_vcl.mk
+@@ -779,6 +779,7 @@ $(eval $(call gb_Library_add_exception_objects,vcl,\
+     vcl/ios/iOSTransferable \
+     vcl/ios/DataFlavorMapping \
+     vcl/ios/HtmlFmtFlt \
++    vcl/quartz/CoreTextFontManager \
+     vcl/quartz/CoreTextFont \
+     vcl/quartz/CoreTextFontFace \
+     vcl/quartz/SystemFontList \
+@@ -799,6 +800,9 @@ endif
+
+
+ ifeq ($(OS),MACOSX)
++$(eval $(call gb_Library_add_exception_objects,vcl,\
++    vcl/quartz/CoreTextFontManager \
++))
+ $(eval $(call gb_Library_add_objcxxobjects,vcl,\
+     vcl/quartz/cgutils \
+     $(if $(filter SKIA,$(BUILD_TYPE)), \
+@@ -808,6 +812,7 @@ $(eval $(call gb_Library_add_objcxxobjects,vcl,\
+ $(eval $(call gb_Library_use_system_darwin_frameworks,vcl,\
+     Cocoa \
+     CoreFoundation \
++    CoreText \
+     Metal \
+ ))
+ endif
+--- /dev/null
++++ b/vcl/inc/quartz/CoreTextFontManager.hxx
+@@ -0,0 +1,32 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++#pragma once
++
++#include <sal/config.h>
++
++#include <premac.h>
++#include <CoreText/CoreText.h>
++#include <postmac.h>
++
++#include <fontattributes.hxx>
++#include <rtl/ustring.hxx>
++#include <vcl/dllapi.h>
++
++// Keep process-local CoreText registration in one place for Aqua and headless SVP.
++VCL_DLLPUBLIC bool RegisterCoreTextFont(const OUString&);
++VCL_DLLPUBLIC bool UnregisterCoreTextFont(const OUString&);
++VCL_DLLPUBLIC void RegisterCoreTextPrivateFonts();
++VCL_DLLPUBLIC sal_uInt64 GetCoreTextFontGeneration();
++VCL_DLLPUBLIC CTFontDescriptorRef FindCoreTextFontDescriptor(
++    CFDictionaryRef, CFStringRef, CFStringRef, CFStringRef, CFStringRef);
++
++VCL_DLLPUBLIC FontAttributes DevFontFromCTFontDescriptor(CTFontDescriptorRef, bool*);
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+--- a/vcl/inc/quartz/SystemFontList.hxx
++++ b/vcl/inc/quartz/SystemFontList.hxx
+@@ -33,6 +33,7 @@
+ #include <postmac.h>
+
+ #include <font/PhysicalFontFace.hxx>
++#include <quartz/CoreTextFontManager.hxx>
+ #ifdef IOS
+ #include <font/PhysicalFontCollection.hxx>
+ #endif
+@@ -64,7 +65,6 @@ private:
+     std::unordered_map<sal_IntPtr, rtl::Reference<CoreTextFontFace>> maFontContainer;
+ };
+
+-FontAttributes DevFontFromCTFontDescriptor(CTFontDescriptorRef, bool*);
+ std::unique_ptr<SystemFontList> GetCoretextFontList();
+
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+--- /dev/null
++++ b/vcl/quartz/CoreTextFontManager.cxx
+@@ -0,0 +1,420 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * This file incorporates work covered by the following license notice:
++ *
++ *   Licensed to the Apache Software Foundation (ASF) under one or more
++ *   contributor license agreements. See the NOTICE file distributed
++ *   with this work for additional information regarding copyright
++ *   ownership. The ASF licenses this file to you under the Apache
++ *   License, Version 2.0 (the "License"); you may not use this file
++ *   except in compliance with the License. You may obtain a copy of
++ *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
++ */
++
++#include <sal/config.h>
++#include <sal/log.hxx>
++
++#include <config_folders.h>
++#include <osl/file.hxx>
++#include <rtl/bootstrap.h>
++#include <rtl/ustring.hxx>
++
++#include <cmath>
++#include <limits.h>
++#include <memory>
++#include <sys/stat.h>
++#include <vector>
++
++#include <quartz/CoreTextFontManager.hxx>
++
++namespace
++{
++sal_uInt64 gCoreTextFontGeneration = 0;
++
++// CoreText family and style names use the same UTF-16 representation as OUString.
++OUString GetOUStringFromCoreText(CFStringRef pString)
++{
++    if (pString == nullptr)
++        return OUString();
++
++    CFIndex nLength = CFStringGetLength(pString);
++    if (nLength == 0)
++        return OUString();
++
++    const UniChar* pCharacters = CFStringGetCharactersPtr(pString);
++    if (pCharacters != nullptr)
++        return OUString(reinterpret_cast<const sal_Unicode*>(pCharacters), nLength);
++
++    std::unique_ptr<UniChar[]> pBuffer(new UniChar[nLength]);
++    CFStringGetCharacters(pString, CFRangeMake(0, nLength), pBuffer.get());
++    return OUString(reinterpret_cast<const sal_Unicode*>(pBuffer.get()), nLength);
++}
++}
++
++// CoreText only sees LibreOffice's private fonts after they have been registered for this process.
++bool RegisterCoreTextFont(const OUString& rFontFileURL)
++{
++    OUString aSystemPath;
++    if (osl::FileBase::getSystemPathFromFileURL(rFontFileURL, aSystemPath)
++        != osl::FileBase::E_None)
++    {
++        return false;
++    }
++
++    OString aFileName = OUStringToOString(aSystemPath, RTL_TEXTENCODING_UTF8);
++    CFStringRef pFontPath = CFStringCreateWithCString(
++        nullptr, aFileName.getStr(), kCFStringEncodingUTF8);
++    if (!pFontPath)
++        return false;
++
++    CFURLRef pFontURL = CFURLCreateWithFileSystemPath(
++        nullptr, pFontPath, kCFURLPOSIXPathStyle, true);
++    CFRelease(pFontPath);
++    if (!pFontURL)
++        return false;
++
++    CFErrorRef pError = nullptr;
++    bool bSuccess
++        = CTFontManagerRegisterFontsForURL(pFontURL, kCTFontManagerScopeProcess, &pError);
++    if (pError)
++        CFRelease(pError);
++    CFRelease(pFontURL);
++    if (bSuccess)
++        ++gCoreTextFontGeneration;
++    return bSuccess;
++}
++
++// Unregistering through the same helper keeps Aqua's temporary-font lifecycle unchanged.
++bool UnregisterCoreTextFont(const OUString& rFontFileURL)
++{
++    OUString aSystemPath;
++    if (osl::FileBase::getSystemPathFromFileURL(rFontFileURL, aSystemPath)
++        != osl::FileBase::E_None)
++    {
++        return false;
++    }
++
++    OString aFileName = OUStringToOString(aSystemPath, RTL_TEXTENCODING_UTF8);
++    CFStringRef pFontPath = CFStringCreateWithCString(
++        nullptr, aFileName.getStr(), kCFStringEncodingUTF8);
++    if (!pFontPath)
++        return false;
++
++    CFURLRef pFontURL = CFURLCreateWithFileSystemPath(
++        nullptr, pFontPath, kCFURLPOSIXPathStyle, true);
++    CFRelease(pFontPath);
++    if (!pFontURL)
++        return false;
++
++    bool bSuccess = CTFontManagerUnregisterFontsForURL(
++        pFontURL, kCTFontManagerScopeProcess, nullptr);
++    CFRelease(pFontURL);
++    if (bSuccess)
++        ++gCoreTextFontGeneration;
++    return bSuccess;
++}
++
++static void RegisterCoreTextFontDir(const OUString& rFontDirURL)
++{
++    osl::Directory aFontDir(rFontDirURL);
++    if (aFontDir.open() != osl::FileBase::E_None)
++        return;
++
++    osl::DirectoryItem aDirItem;
++    while (aFontDir.getNextItem(aDirItem, 10) == osl::FileBase::E_None)
++    {
++        osl::FileStatus aFileStatus(osl_FileStatus_Mask_FileURL);
++        if (aDirItem.getFileStatus(aFileStatus) == osl::FileBase::E_None)
++            RegisterCoreTextFont(aFileStatus.getFileURL());
++    }
++}
++
++// Register the bundled fallback fonts before either backend snapshots CoreText's inventory.
++void RegisterCoreTextPrivateFonts()
++{
++    static bool bFirst = true;
++    if (!bFirst)
++        return;
++    bFirst = false;
++
++    OUString aBrandPath("$BRAND_BASE_DIR");
++    rtl_bootstrap_expandMacros(&aBrandPath.pData);
++    RegisterCoreTextFontDir(
++        aBrandPath + "/" LIBO_SHARE_RESOURCE_FOLDER "/common/fonts/");
++    RegisterCoreTextFontDir(aBrandPath + "/" LIBO_SHARE_FOLDER "/fonts/truetype/");
++}
++
++// SVP uses this to rebuild its snapshot only after CoreText registrations change.
++sal_uInt64 GetCoreTextFontGeneration()
++{
++    return gCoreTextFontGeneration;
++}
++
++// Compare file identity so a Fontconfig symlink can still match CoreText's resolved path.
++static bool CoreTextFontDescriptorMatchesFile(CTFontDescriptorRef descriptor,
++                                              CFStringRef requestedFile)
++{
++    if (descriptor == nullptr || requestedFile == nullptr)
++        return false;
++
++    CFURLRef descriptorURL = static_cast<CFURLRef>(
++        CTFontDescriptorCopyAttribute(descriptor, kCTFontURLAttribute));
++    if (descriptorURL == nullptr)
++        return false;
++
++    CFStringRef descriptorFile
++        = CFURLCopyFileSystemPath(descriptorURL, kCFURLPOSIXPathStyle);
++    CFRelease(descriptorURL);
++    if (descriptorFile == nullptr)
++        return false;
++
++    bool matches = CFEqual(descriptorFile, requestedFile);
++    if (!matches)
++    {
++        char descriptorPath[PATH_MAX];
++        char requestedPath[PATH_MAX];
++        struct stat descriptorStatus;
++        struct stat requestedStatus;
++        matches = CFStringGetCString(
++                      descriptorFile, descriptorPath, sizeof(descriptorPath), kCFStringEncodingUTF8)
++                  && CFStringGetCString(
++                      requestedFile, requestedPath, sizeof(requestedPath), kCFStringEncodingUTF8)
++                  && stat(descriptorPath, &descriptorStatus) == 0
++                  && stat(requestedPath, &requestedStatus) == 0
++                  && descriptorStatus.st_dev == requestedStatus.st_dev
++                  && descriptorStatus.st_ino == requestedStatus.st_ino;
++    }
++    CFRelease(descriptorFile);
++    return matches;
++}
++
++// Find the CoreText descriptor selected for a Fontconfig face without crossing duplicate files.
++CTFontDescriptorRef FindCoreTextFontDescriptor(CFDictionaryRef fonts, CFStringRef requestedName,
++                                               CFStringRef requestedFile,
++                                               CFStringRef requestedFamily,
++                                               CFStringRef requestedStyle)
++{
++    if (fonts == nullptr || requestedName == nullptr || requestedFile == nullptr
++        || requestedFamily == nullptr || requestedStyle == nullptr)
++    {
++        return nullptr;
++    }
++
++    CTFontDescriptorRef descriptor = static_cast<CTFontDescriptorRef>(
++        CFDictionaryGetValue(fonts, requestedName));
++    if (CoreTextFontDescriptorMatchesFile(descriptor, requestedFile))
++        return descriptor;
++
++    const void* keyValues[] = { requestedFile, requestedFamily, requestedStyle };
++    CFArrayRef key = CFArrayCreate(nullptr, keyValues, 3, &kCFTypeArrayCallBacks);
++    descriptor = static_cast<CTFontDescriptorRef>(CFDictionaryGetValue(fonts, key));
++    CFRelease(key);
++    if (descriptor != nullptr)
++        return descriptor;
++
++    const CFIndex count = CFDictionaryGetCount(fonts);
++    if (count == 0)
++        return nullptr;
++    std::vector<const void*> descriptors(count);
++    CFDictionaryGetKeysAndValues(fonts, nullptr, descriptors.data());
++    for (const void* value : descriptors)
++    {
++        descriptor = static_cast<CTFontDescriptorRef>(value);
++        CFStringRef family = static_cast<CFStringRef>(
++            CTFontDescriptorCopyAttribute(descriptor, kCTFontFamilyNameAttribute));
++        CFStringRef style = static_cast<CFStringRef>(
++            CTFontDescriptorCopyAttribute(descriptor, kCTFontStyleNameAttribute));
++        const bool matches = family != nullptr && style != nullptr
++                             && CFEqual(family, requestedFamily) && CFEqual(style, requestedStyle)
++                             && CoreTextFontDescriptorMatchesFile(descriptor, requestedFile);
++        if (style != nullptr)
++            CFRelease(style);
++        if (family != nullptr)
++            CFRelease(family);
++        if (matches)
++            return descriptor;
++    }
++    return nullptr;
++}
++
++FontAttributes DevFontFromCTFontDescriptor( CTFontDescriptorRef pFD, bool* bFontEnabled )
++{
++    // all CoreText fonts are device fonts that can rotate just fine
++    FontAttributes rDFA;
++    rDFA.SetQuality( 0 );
++
++    // reset the font attributes
++    rDFA.SetFamilyType( FAMILY_DONTKNOW );
++    rDFA.SetPitch( PITCH_VARIABLE );
++    rDFA.SetWidthType( WIDTH_NORMAL );
++    rDFA.SetWeight( WEIGHT_NORMAL );
++    rDFA.SetItalic( ITALIC_NONE );
++    rDFA.SetMicrosoftSymbolEncoded( false );
++
++    // get font name
++    CFStringRef pLang = nullptr;
++    CFStringRef pFamilyName = static_cast<CFStringRef>(
++            CTFontDescriptorCopyLocalizedAttribute( pFD, kCTFontFamilyNameAttribute, &pLang ));
++
++    if ( !pLang )
++    {
++        if( pFamilyName )
++        {
++            CFRelease( pFamilyName );
++        }
++        pFamilyName = static_cast<CFStringRef>(CTFontDescriptorCopyAttribute( pFD, kCTFontFamilyNameAttribute ));
++    }
++
++    rDFA.SetFamilyName( GetOUStringFromCoreText( pFamilyName ) );
++    if (pLang)
++        CFRelease(pLang);
++    if (pFamilyName)
++        CFRelease(pFamilyName);
++
++    // get font style
++    CFStringRef pStyleName = static_cast<CFStringRef>(CTFontDescriptorCopyAttribute( pFD, kCTFontStyleNameAttribute ));
++    rDFA.SetStyleName( GetOUStringFromCoreText( pStyleName ) );
++    if (pStyleName)
++        CFRelease(pStyleName);
++
++    // get font-enabled status
++    if( bFontEnabled )
++    {
++        int bEnabled = TRUE; // by default (and when we're on macOS < 10.6) it's "enabled"
++        CFNumberRef pEnabled = static_cast<CFNumberRef>(CTFontDescriptorCopyAttribute( pFD, kCTFontEnabledAttribute ));
++        if (pEnabled)
++        {
++            CFNumberGetValue( pEnabled, kCFNumberIntType, &bEnabled );
++            CFRelease(pEnabled);
++        }
++        *bFontEnabled = bEnabled;
++    }
++
++    // get font attributes
++    CFDictionaryRef pAttrDict = static_cast<CFDictionaryRef>(CTFontDescriptorCopyAttribute( pFD, kCTFontTraitsAttribute ));
++
++    if (bFontEnabled && *bFontEnabled)
++    {
++        // Ignore font formats not supported.
++        int nFormat;
++        CFNumberRef pFormat = static_cast<CFNumberRef>(CTFontDescriptorCopyAttribute(pFD, kCTFontFormatAttribute));
++        CFNumberGetValue(pFormat, kCFNumberIntType, &nFormat);
++        if (nFormat == kCTFontFormatUnrecognized || nFormat == kCTFontFormatPostScript || nFormat == kCTFontFormatBitmap)
++        {
++            SAL_INFO("vcl.fonts", "Ignoring font with unsupported format: " << rDFA.GetFamilyName());
++            *bFontEnabled = false;
++        }
++        CFRelease(pFormat);
++    }
++
++    // get symbolic trait
++    // TODO: use other traits such as MonoSpace/Condensed/Expanded or Vertical too
++    SInt64 nSymbolTrait = 0;
++    CFNumberRef pSymbolNum = nullptr;
++    if( CFDictionaryGetValueIfPresent( pAttrDict, kCTFontSymbolicTrait, reinterpret_cast<const void**>(&pSymbolNum) ) )
++    {
++        CFNumberGetValue( pSymbolNum, kCFNumberSInt64Type, &nSymbolTrait );
++        if (nSymbolTrait & kCTFontMonoSpaceTrait)
++            rDFA.SetPitch(PITCH_FIXED);
++    }
++
++    // get the font weight
++    double fWeight = 0;
++    CFNumberRef pWeightNum = static_cast<CFNumberRef>(CFDictionaryGetValue( pAttrDict, kCTFontWeightTrait ));
++    // tdf#140401 check if attribute is a nullptr
++    if( pWeightNum )
++        CFNumberGetValue( pWeightNum, kCFNumberDoubleType, &fWeight );
++    int nInt = WEIGHT_NORMAL;
++
++    // Special case fixes
++
++    // tdf#67744: Courier Std Medium is always bold. We get a kCTFontWeightTrait of 0.23 which
++    // surely must be wrong.
++    if (rDFA.GetFamilyName() == "Courier Std" &&
++        (rDFA.GetStyleName() == "Medium" || rDFA.GetStyleName() == "Medium Oblique") &&
++        fWeight > 0.2)
++    {
++        fWeight = 0;
++    }
++
++    // tdf#68889: Ditto for Gill Sans MT Pro. Here I can kinda understand it, maybe the
++    // kCTFontWeightTrait is intended to give a subjective "optical" impression of how the font
++    // looks, and Gill Sans MT Pro Medium is kinda heavy. But with the way LibreOffice uses fonts,
++    // we still should think of it as being "medium" weight.
++    if (rDFA.GetFamilyName() == "Gill Sans MT Pro" &&
++        (rDFA.GetStyleName() == "Medium" || rDFA.GetStyleName() == "Medium Italic") &&
++        fWeight > 0.2)
++    {
++        fWeight = 0;
++    }
++
++    if( fWeight > 0 )
++    {
++        nInt = rint(int(WEIGHT_NORMAL) + fWeight * ((WEIGHT_BLACK - WEIGHT_NORMAL)/0.68));
++        if( nInt > WEIGHT_BLACK )
++        {
++            nInt = WEIGHT_BLACK;
++        }
++    }
++    else if( fWeight < 0 )
++    {
++        nInt = rint(int(WEIGHT_NORMAL) + fWeight * ((WEIGHT_NORMAL - WEIGHT_THIN)/0.8));
++        if( nInt < WEIGHT_THIN )
++        {
++            nInt = WEIGHT_THIN;
++        }
++    }
++    rDFA.SetWeight( static_cast<FontWeight>(nInt) );
++
++    // get the font slant
++    double fSlant = 0;
++    CFNumberRef pSlantNum = static_cast<CFNumberRef>(CFDictionaryGetValue( pAttrDict, kCTFontSlantTrait ));
++    // tdf#140401 check if attribute is a nullptr
++    if( pSlantNum )
++        CFNumberGetValue( pSlantNum, kCFNumberDoubleType, &fSlant );
++    if( fSlant >= 0.035 )
++    {
++        rDFA.SetItalic( ITALIC_NORMAL );
++    }
++    // get width trait
++    double fWidth = 0;
++    CFNumberRef pWidthNum = static_cast<CFNumberRef>(CFDictionaryGetValue( pAttrDict, kCTFontWidthTrait ));
++    // tdf#140401 check if attribute is a nullptr
++    if( pWidthNum )
++        CFNumberGetValue( pWidthNum, kCFNumberDoubleType, &fWidth );
++    nInt = WIDTH_NORMAL;
++
++    if( fWidth > 0 )
++    {
++        nInt = rint( int(WIDTH_NORMAL) + fWidth * ((WIDTH_ULTRA_EXPANDED - WIDTH_NORMAL)/0.4));
++        if( nInt > WIDTH_ULTRA_EXPANDED )
++        {
++            nInt = WIDTH_ULTRA_EXPANDED;
++        }
++    }
++    else if( fWidth < 0 )
++    {
++        nInt = rint( int(WIDTH_NORMAL) + fWidth * ((WIDTH_NORMAL - WIDTH_ULTRA_CONDENSED)/0.5));
++        if( nInt < WIDTH_ULTRA_CONDENSED )
++        {
++            nInt = WIDTH_ULTRA_CONDENSED;
++        }
++    }
++    rDFA.SetWidthType( static_cast<FontWidth>(nInt) );
++
++    // release the attribute dict that we had copied
++    CFRelease( pAttrDict );
++
++    // TODO? also use the HEAD table if available to get more attributes
++//  CFDataRef CTFontCopyTable( CTFontRef, kCTFontTableHead, /*kCTFontTableOptionNoOptions*/kCTFontTableOptionExcludeSynthetic );
++
++    return rDFA;
++}
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+--- a/vcl/quartz/SystemFontList.cxx
++++ b/vcl/quartz/SystemFontList.cxx
+@@ -36,171 +36,6 @@
+ #include <quartz/utils.h>
+ #include <sallayout.hxx>
+
+-
+-FontAttributes DevFontFromCTFontDescriptor( CTFontDescriptorRef pFD, bool* bFontEnabled )
+-{
+-    // all CoreText fonts are device fonts that can rotate just fine
+-    FontAttributes rDFA;
+-    rDFA.SetQuality( 0 );
+-
+-    // reset the font attributes
+-    rDFA.SetFamilyType( FAMILY_DONTKNOW );
+-    rDFA.SetPitch( PITCH_VARIABLE );
+-    rDFA.SetWidthType( WIDTH_NORMAL );
+-    rDFA.SetWeight( WEIGHT_NORMAL );
+-    rDFA.SetItalic( ITALIC_NONE );
+-    rDFA.SetMicrosoftSymbolEncoded( false );
+-
+-    // get font name
+-    CFStringRef pLang = nullptr;
+-    CFStringRef pFamilyName = static_cast<CFStringRef>(
+-            CTFontDescriptorCopyLocalizedAttribute( pFD, kCTFontFamilyNameAttribute, &pLang ));
+-
+-    if ( !pLang )
+-    {
+-        if( pFamilyName )
+-        {
+-            CFRelease( pFamilyName );
+-        }
+-        pFamilyName = static_cast<CFStringRef>(CTFontDescriptorCopyAttribute( pFD, kCTFontFamilyNameAttribute ));
+-    }
+-
+-    rDFA.SetFamilyName( GetOUString( pFamilyName ) );
+-
+-    // get font style
+-    CFStringRef pStyleName = static_cast<CFStringRef>(CTFontDescriptorCopyAttribute( pFD, kCTFontStyleNameAttribute ));
+-    rDFA.SetStyleName( GetOUString( pStyleName ) );
+-
+-    // get font-enabled status
+-    if( bFontEnabled )
+-    {
+-        int bEnabled = TRUE; // by default (and when we're on macOS < 10.6) it's "enabled"
+-        CFNumberRef pEnabled = static_cast<CFNumberRef>(CTFontDescriptorCopyAttribute( pFD, kCTFontEnabledAttribute ));
+-        CFNumberGetValue( pEnabled, kCFNumberIntType, &bEnabled );
+-        *bFontEnabled = bEnabled;
+-    }
+-
+-    // get font attributes
+-    CFDictionaryRef pAttrDict = static_cast<CFDictionaryRef>(CTFontDescriptorCopyAttribute( pFD, kCTFontTraitsAttribute ));
+-
+-    if (bFontEnabled && *bFontEnabled)
+-    {
+-        // Ignore font formats not supported.
+-        int nFormat;
+-        CFNumberRef pFormat = static_cast<CFNumberRef>(CTFontDescriptorCopyAttribute(pFD, kCTFontFormatAttribute));
+-        CFNumberGetValue(pFormat, kCFNumberIntType, &nFormat);
+-        if (nFormat == kCTFontFormatUnrecognized || nFormat == kCTFontFormatPostScript || nFormat == kCTFontFormatBitmap)
+-        {
+-            SAL_INFO("vcl.fonts", "Ignoring font with unsupported format: " << rDFA.GetFamilyName());
+-            *bFontEnabled = false;
+-        }
+-        CFRelease(pFormat);
+-    }
+-
+-    // get symbolic trait
+-    // TODO: use other traits such as MonoSpace/Condensed/Expanded or Vertical too
+-    SInt64 nSymbolTrait = 0;
+-    CFNumberRef pSymbolNum = nullptr;
+-    if( CFDictionaryGetValueIfPresent( pAttrDict, kCTFontSymbolicTrait, reinterpret_cast<const void**>(&pSymbolNum) ) )
+-    {
+-        CFNumberGetValue( pSymbolNum, kCFNumberSInt64Type, &nSymbolTrait );
+-        if (nSymbolTrait & kCTFontMonoSpaceTrait)
+-            rDFA.SetPitch(PITCH_FIXED);
+-    }
+-
+-    // get the font weight
+-    double fWeight = 0;
+-    CFNumberRef pWeightNum = static_cast<CFNumberRef>(CFDictionaryGetValue( pAttrDict, kCTFontWeightTrait ));
+-    // tdf#140401 check if attribute is a nullptr
+-    if( pWeightNum )
+-        CFNumberGetValue( pWeightNum, kCFNumberDoubleType, &fWeight );
+-    int nInt = WEIGHT_NORMAL;
+-
+-    // Special case fixes
+-
+-    // tdf#67744: Courier Std Medium is always bold. We get a kCTFontWeightTrait of 0.23 which
+-    // surely must be wrong.
+-    if (rDFA.GetFamilyName() == "Courier Std" &&
+-        (rDFA.GetStyleName() == "Medium" || rDFA.GetStyleName() == "Medium Oblique") &&
+-        fWeight > 0.2)
+-    {
+-        fWeight = 0;
+-    }
+-
+-    // tdf#68889: Ditto for Gill Sans MT Pro. Here I can kinda understand it, maybe the
+-    // kCTFontWeightTrait is intended to give a subjective "optical" impression of how the font
+-    // looks, and Gill Sans MT Pro Medium is kinda heavy. But with the way LibreOffice uses fonts,
+-    // we still should think of it as being "medium" weight.
+-    if (rDFA.GetFamilyName() == "Gill Sans MT Pro" &&
+-        (rDFA.GetStyleName() == "Medium" || rDFA.GetStyleName() == "Medium Italic") &&
+-        fWeight > 0.2)
+-    {
+-        fWeight = 0;
+-    }
+-
+-    if( fWeight > 0 )
+-    {
+-        nInt = rint(int(WEIGHT_NORMAL) + fWeight * ((WEIGHT_BLACK - WEIGHT_NORMAL)/0.68));
+-        if( nInt > WEIGHT_BLACK )
+-        {
+-            nInt = WEIGHT_BLACK;
+-        }
+-    }
+-    else if( fWeight < 0 )
+-    {
+-        nInt = rint(int(WEIGHT_NORMAL) + fWeight * ((WEIGHT_NORMAL - WEIGHT_THIN)/0.8));
+-        if( nInt < WEIGHT_THIN )
+-        {
+-            nInt = WEIGHT_THIN;
+-        }
+-    }
+-    rDFA.SetWeight( static_cast<FontWeight>(nInt) );
+-
+-    // get the font slant
+-    double fSlant = 0;
+-    CFNumberRef pSlantNum = static_cast<CFNumberRef>(CFDictionaryGetValue( pAttrDict, kCTFontSlantTrait ));
+-    // tdf#140401 check if attribute is a nullptr
+-    if( pSlantNum )
+-        CFNumberGetValue( pSlantNum, kCFNumberDoubleType, &fSlant );
+-    if( fSlant >= 0.035 )
+-    {
+-        rDFA.SetItalic( ITALIC_NORMAL );
+-    }
+-    // get width trait
+-    double fWidth = 0;
+-    CFNumberRef pWidthNum = static_cast<CFNumberRef>(CFDictionaryGetValue( pAttrDict, kCTFontWidthTrait ));
+-    // tdf#140401 check if attribute is a nullptr
+-    if( pWidthNum )
+-        CFNumberGetValue( pWidthNum, kCFNumberDoubleType, &fWidth );
+-    nInt = WIDTH_NORMAL;
+-
+-    if( fWidth > 0 )
+-    {
+-        nInt = rint( int(WIDTH_NORMAL) + fWidth * ((WIDTH_ULTRA_EXPANDED - WIDTH_NORMAL)/0.4));
+-        if( nInt > WIDTH_ULTRA_EXPANDED )
+-        {
+-            nInt = WIDTH_ULTRA_EXPANDED;
+-        }
+-    }
+-    else if( fWidth < 0 )
+-    {
+-        nInt = rint( int(WIDTH_NORMAL) + fWidth * ((WIDTH_NORMAL - WIDTH_ULTRA_CONDENSED)/0.5));
+-        if( nInt < WIDTH_ULTRA_CONDENSED )
+-        {
+-            nInt = WIDTH_ULTRA_CONDENSED;
+-        }
+-    }
+-    rDFA.SetWidthType( static_cast<FontWidth>(nInt) );
+-
+-    // release the attribute dict that we had copied
+-    CFRelease( pAttrDict );
+-
+-    // TODO? also use the HEAD table if available to get more attributes
+-//  CFDataRef CTFontCopyTable( CTFontRef, kCTFontTableHead, /*kCTFontTableOptionNoOptions*/kCTFontTableOptionExcludeSynthetic );
+-
+-    return rDFA;
+-}
+-
+ static void fontEnumCallBack( const void* pValue, void* pContext )
+ {
+     CTFontDescriptorRef pFD = static_cast<CTFontDescriptorRef>(pValue);
+--- a/vcl/quartz/salgdi.cxx
++++ b/vcl/quartz/salgdi.cxx
+@@ -22,7 +22,6 @@
+ #include <memory>
+
+ #include <sal/log.hxx>
+-#include <config_folders.h>
+
+ #include <basegfx/matrix/b2dhommatrix.hxx>
+ #include <basegfx/matrix/b2dhommatrixtools.hxx>
+@@ -30,9 +29,7 @@
+ #include <basegfx/polygon/b2dpolygontools.hxx>
+ #include <basegfx/range/b2drectangle.hxx>
+ #include <osl/diagnose.h>
+-#include <osl/file.hxx>
+ #include <osl/process.h>
+-#include <rtl/bootstrap.h>
+ #include <rtl/strbuf.hxx>
+ #include <rtl/ustrbuf.hxx>
+ #include <tools/long.hxx>
+@@ -207,15 +204,7 @@ void AquaSalGraphics::GetFontMetric(FontMetricDataRef& rxFontMetric, int nFallba
+
+ static bool AddTempDevFont(const OUString& rFontFileURL)
+ {
+-    OUString aUSystemPath;
+-    OSL_VERIFY( !osl::FileBase::getSystemPathFromFileURL( rFontFileURL, aUSystemPath ) );
+-    OString aCFileName = OUStringToOString( aUSystemPath, RTL_TEXTENCODING_UTF8 );
+-
+-    CFStringRef rFontPath = CFStringCreateWithCString(nullptr, aCFileName.getStr(), kCFStringEncodingUTF8);
+-    CFURLRef rFontURL = CFURLCreateWithFileSystemPath(nullptr, rFontPath, kCFURLPOSIXPathStyle, true);
+-
+-    CFErrorRef error;
+-    bool success = CTFontManagerRegisterFontsForURL(rFontURL, kCTFontManagerScopeProcess, &error);
++    bool success = RegisterCoreTextFont(rFontFileURL);
+     if (success)
+     {
+         // tdf155212 clear the cached system font list after loading a font
+@@ -233,79 +222,21 @@ static bool AddTempDevFont(const OUString& rFontFileURL)
+         SalData* pSalData = GetSalData();
+         pSalData->mpFontList.reset();
+     }
+-    else
+-    {
+-        CFRelease(error);
+-    }
+-    CFRelease(rFontPath);
+-    CFRelease(rFontURL);
+
+     return success;
+ }
+
+ static bool RemoveTempDevFont(const OUString& rFontFileURL)
+ {
+-    OUString aUSystemPath;
+-    OSL_VERIFY(!osl::FileBase::getSystemPathFromFileURL(rFontFileURL, aUSystemPath));
+-    OString aCFileName = OUStringToOString(aUSystemPath, RTL_TEXTENCODING_UTF8);
+-
+-    CFStringRef rFontPath
+-        = CFStringCreateWithCString(nullptr, aCFileName.getStr(), kCFStringEncodingUTF8);
+-    CFURLRef rFontURL
+-        = CFURLCreateWithFileSystemPath(nullptr, rFontPath, kCFURLPOSIXPathStyle, true);
+-
+-    CTFontManagerUnregisterFontsForURL(rFontURL, kCTFontManagerScopeProcess, nullptr);
+-
+-    CFRelease(rFontPath);
+-    CFRelease(rFontURL);
+-
+-    return true; // Assume that even errors meant that there was nothing to remove
+-}
+-
+-static void AddTempFontDir( const OUString &rFontDirUrl )
+-{
+-    osl::Directory aFontDir( rFontDirUrl );
+-    osl::FileBase::RC rcOSL = aFontDir.open();
+-    if( rcOSL == osl::FileBase::E_None )
+-    {
+-        osl::DirectoryItem aDirItem;
+-
+-        while( aFontDir.getNextItem( aDirItem, 10 ) == osl::FileBase::E_None )
+-        {
+-            osl::FileStatus aFileStatus( osl_FileStatus_Mask_FileURL );
+-            rcOSL = aDirItem.getFileStatus( aFileStatus );
+-            if ( rcOSL == osl::FileBase::E_None )
+-            {
+-                AddTempDevFont(aFileStatus.getFileURL());
+-            }
+-        }
+-    }
+-}
+-
+-static void AddLocalTempFontDirs()
+-{
+-    static bool bFirst = true;
+-    if( !bFirst )
+-        return;
+-
+-    bFirst = false;
+-
+-    // add private font files
+-
+-    OUString aBrandStr( "$BRAND_BASE_DIR" );
+-    rtl_bootstrap_expandMacros( &aBrandStr.pData );
+-
+-    // internal font resources, required for normal operation, like OpenSymbol
+-    AddTempFontDir( aBrandStr + "/" LIBO_SHARE_RESOURCE_FOLDER "/common/fonts/" );
+-
+-    AddTempFontDir( aBrandStr + "/" LIBO_SHARE_FOLDER "/fonts/truetype/" );
++    UnregisterCoreTextFont(rFontFileURL);
++    return true; // Assume that errors meant there was nothing left to remove
+ }
+
+ void AquaSalGraphics::GetDevFontList(vcl::font::PhysicalFontCollection* pFontCollection)
+ {
+     SAL_WARN_IF( !pFontCollection, "vcl", "AquaSalGraphics::GetDevFontList(NULL) !");
+
+-    AddLocalTempFontDirs();
++    RegisterCoreTextPrivateFonts();
+
+     // The idea is to cache the list of system fonts once it has been generated.
+     // SalData seems to be a good place for this caching. However we have to
+--- a/vcl/unx/generic/fontmanager/fontconfig.cxx
++++ b/vcl/unx/generic/fontmanager/fontconfig.cxx
+@@ -19,6 +19,10 @@
+
+ #include <sal/config.h>
+
++#ifdef MACOSX
++#include <quartz/CoreTextFontManager.hxx>
++#endif
++
+ #include <iostream>
+ #include <memory>
+ #include <string_view>
+@@ -559,6 +563,137 @@ namespace
+         return WEIGHT_BLACK;
+     }
+
++#ifdef MACOSX
++    /** Builds the same font inventory that the Aqua VCL plugin receives from CoreText. */
++    CFDictionaryRef getCoreTextFonts()
++    {
++        RegisterCoreTextPrivateFonts();
++
++        static CFMutableDictionaryRef fonts = nullptr;
++        static sal_uInt64 generation = 0;
++        const sal_uInt64 currentGeneration = GetCoreTextFontGeneration();
++        if (fonts != nullptr && generation == currentGeneration)
++            return fonts;
++
++        if (fonts != nullptr)
++            CFRelease(fonts);
++        fonts = CFDictionaryCreateMutable(
++            nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++        CFMutableDictionaryRef options = CFDictionaryCreateMutable(
++            nullptr, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++        CFDictionaryAddValue(options, kCTFontCollectionRemoveDuplicatesOption, kCFBooleanTrue);
++        CTFontCollectionRef collection = CTFontCollectionCreateFromAvailableFonts(options);
++        CFArrayRef descriptors = CTFontCollectionCreateMatchingFontDescriptors(collection);
++        for (CFIndex i = 0; i < CFArrayGetCount(descriptors); ++i)
++        {
++            CTFontDescriptorRef descriptor = static_cast<CTFontDescriptorRef>(
++                CFArrayGetValueAtIndex(descriptors, i));
++            CFStringRef name = static_cast<CFStringRef>(
++                CTFontDescriptorCopyAttribute(descriptor, kCTFontNameAttribute));
++            if (name != nullptr)
++            {
++                CFDictionarySetValue(fonts, name, descriptor);
++
++                CFDictionaryRef variations = static_cast<CFDictionaryRef>(
++                    CTFontDescriptorCopyAttribute(descriptor, kCTFontVariationAttribute));
++                if (variations != nullptr && CFDictionaryGetCount(variations) > 0)
++                {
++                    // Variable-face PostScript names differ between CoreText and Fontconfig.
++                    // Keep the fallback key stable when the UI localizes family or style names.
++                    CFURLRef url = static_cast<CFURLRef>(
++                        CTFontDescriptorCopyAttribute(descriptor, kCTFontURLAttribute));
++                    CFStringRef file = url == nullptr
++                        ? nullptr
++                        : CFURLCopyFileSystemPath(url, kCFURLPOSIXPathStyle);
++                    CFStringRef family = static_cast<CFStringRef>(
++                        CTFontDescriptorCopyAttribute(descriptor, kCTFontFamilyNameAttribute));
++                    CFStringRef style = static_cast<CFStringRef>(
++                        CTFontDescriptorCopyAttribute(descriptor, kCTFontStyleNameAttribute));
++                    if (file != nullptr && family != nullptr && style != nullptr)
++                    {
++                        const void* values[] = { file, family, style };
++                        CFArrayRef key
++                            = CFArrayCreate(nullptr, values, 3, &kCFTypeArrayCallBacks);
++                        if (!CFDictionaryContainsKey(fonts, key))
++                            CFDictionarySetValue(fonts, key, descriptor);
++                        CFRelease(key);
++                    }
++                    if (style != nullptr)
++                        CFRelease(style);
++                    if (family != nullptr)
++                        CFRelease(family);
++                    if (file != nullptr)
++                        CFRelease(file);
++                    if (url != nullptr)
++                        CFRelease(url);
++                }
++                if (variations != nullptr)
++                    CFRelease(variations);
++                CFRelease(name);
++            }
++        }
++        CFRelease(descriptors);
++        CFRelease(collection);
++        CFRelease(options);
++        generation = currentGeneration;
++        return fonts;
++    }
++
++    /** Uses Aqua's metadata while leaving SVP to open the face through FreeType. */
++    bool applyCoreTextAttributes(const FcChar8* postscriptName, const FcChar8* file,
++                                 const FcChar8* family, const FcChar8* style,
++                                 FontAttributes& attributes)
++    {
++        CFStringRef requestedName = CFStringCreateWithCString(
++            nullptr, reinterpret_cast<const char*>(postscriptName), kCFStringEncodingUTF8);
++        CFStringRef requestedFile = CFStringCreateWithCString(
++            nullptr, reinterpret_cast<const char*>(file), kCFStringEncodingUTF8);
++        CFStringRef requestedFamily = CFStringCreateWithCString(
++            nullptr, reinterpret_cast<const char*>(family), kCFStringEncodingUTF8);
++        CFStringRef requestedStyle = CFStringCreateWithCString(
++            nullptr, reinterpret_cast<const char*>(style), kCFStringEncodingUTF8);
++        CTFontDescriptorRef descriptor = FindCoreTextFontDescriptor(
++            getCoreTextFonts(), requestedName, requestedFile, requestedFamily, requestedStyle);
++        if (requestedStyle != nullptr)
++            CFRelease(requestedStyle);
++        if (requestedFamily != nullptr)
++            CFRelease(requestedFamily);
++        if (requestedFile != nullptr)
++            CFRelease(requestedFile);
++        if (requestedName != nullptr)
++            CFRelease(requestedName);
++        if (descriptor == nullptr)
++            return false;
++
++        CTFontRef font = CTFontCreateWithFontDescriptor(descriptor, 12.0, nullptr);
++        if (font == nullptr)
++            return false;
++        CFArrayRef tableTags = CTFontCopyAvailableTables(font, kCTFontTableOptionNoOptions);
++        bool hasGlyf = false;
++        bool hasHvgl = false;
++        for (CFIndex i = 0; tableTags != nullptr && i < CFArrayGetCount(tableTags); ++i)
++        {
++            const CTFontTableTag tag
++                = reinterpret_cast<uintptr_t>(CFArrayGetValueAtIndex(tableTags, i));
++            hasGlyf |= tag == kCTFontTableGlyf;
++            hasHvgl |= tag == 'hvgl';
++        }
++        if (tableTags != nullptr)
++            CFRelease(tableTags);
++        CFRelease(font);
++        if (!hasGlyf && hasHvgl)
++            return false;
++
++        bool enabled = false;
++        FontAttributes coreTextAttributes
++            = DevFontFromCTFontDescriptor(descriptor, &enabled);
++        if (!enabled)
++            return false;
++        attributes = coreTextAttributes;
++        return true;
++    }
++#endif
++
+     FontItalic convertSlant(int slant)
+     {
+         // set italic
+@@ -635,6 +770,11 @@ void PrintFontManager::countFontconfigFonts()
+             FcChar8* family = nullptr;
+             FcChar8* style = nullptr;
+             FcChar8* format = nullptr;
++#ifdef MACOSX
++            FcChar8* postscriptName = nullptr;
++            FcChar8* canonicalFamily = nullptr;
++            FcChar8* canonicalStyle = nullptr;
++#endif
+             int slant = 0;
+             int weight = 0;
+             int width = 0;
+@@ -656,6 +796,13 @@ void PrintFontManager::countFontconfigFonts()
+             FcResult eSymbolRes       = FcPatternGetBool(pFSet->fonts[i], FC_SYMBOL, 0, &symbol);
+             FcResult eIndexRes        = FcPatternGetInteger(pFSet->fonts[i], FC_INDEX, 0, &nEntryId);
+             FcResult eFormatRes       = FcPatternGetString(pFSet->fonts[i], FC_FONTFORMAT, 0, &format);
++#ifdef MACOSX
++            FcResult ePostscriptRes   = FcPatternGetString(pFSet->fonts[i], FC_POSTSCRIPT_NAME, 0, &postscriptName);
++            FcResult canonicalFamilyResult = FcPatternGetString(
++                pFSet->fonts[i], FC_FAMILY, 0, &canonicalFamily);
++            FcResult canonicalStyleResult = FcPatternGetString(
++                pFSet->fonts[i], FC_STYLE, 0, &canonicalStyle);
++#endif
+
+             if( eFileRes != FcResultMatch || eFamilyRes != FcResultMatch || eScalableRes != FcResultMatch || eStyleRes != FcResultMatch )
+                 continue;
+@@ -717,6 +864,13 @@ void PrintFontManager::countFontconfigFonts()
+                 rFA.SetItalic(convertSlant(slant));
+             if (eSymbolRes == FcResultMatch)
+                 rFA.SetMicrosoftSymbolEncoded(bool(symbol));
++#ifdef MACOSX
++            if (ePostscriptRes != FcResultMatch || canonicalFamilyResult != FcResultMatch
++                || canonicalStyleResult != FcResultMatch
++                || !applyCoreTextAttributes(
++                    postscriptName, file, canonicalFamily, canonicalStyle, rFA))
++                continue;
++#endif
+
+             // sort into known fonts
+             fontID nFontID = m_nNextFontID++;
+--- a/vcl/unx/generic/fontmanager/fontsubst.cxx
++++ b/vcl/unx/generic/fontmanager/fontsubst.cxx
+@@ -51,9 +51,11 @@ public:
+
+ void SalGenericInstance::RegisterFontSubstitutors(vcl::font::PhysicalFontCollection* pFontCollection)
+ {
+-    // register font fallback substitutions
++#ifndef MACOSX
++    // Use the same shared missing-family matcher as Aqua on macOS.
+     static FcPreMatchSubstitution aSubstPreMatch;
+     pFontCollection->SetPreMatchHook( &aSubstPreMatch );
++#endif
+
+     // register glyph fallback substitutions
+     static FcGlyphFallbackSubstitution aSubstFallback;
+--- a/vcl/unx/generic/gdi/freetypetextrender.cxx
++++ b/vcl/unx/generic/gdi/freetypetextrender.cxx
+@@ -35,6 +35,9 @@
+ #include <unx/freetype_glyphcache.hxx>
+ #include <font/PhysicalFontFace.hxx>
+ #include <font/FontMetricData.hxx>
++#ifdef MACOSX
++#include <quartz/CoreTextFontManager.hxx>
++#endif
+
+ #include <sallayout.hxx>
+
+@@ -96,11 +99,22 @@ FreeTypeTextRenderImpl::SetTextColor( Color nColor )
+ bool FreeTypeTextRenderImpl::AddTempDevFont(vcl::font::PhysicalFontCollection* pFontCollection,
+                                             const OUString& rFileURL, const OUString& rFontName)
+ {
++#ifdef MACOSX
++    // Keep SVP's view of embedded fonts in step with Aqua's CoreText view.
++    if (!RegisterCoreTextFont(rFileURL))
++        return false;
++#endif
++
+     // inform PSP font manager
+     psp::PrintFontManager& rMgr = psp::PrintFontManager::get();
+     std::vector<psp::fontID> aFontIds = rMgr.addFontFile(rFileURL);
+     if (aFontIds.empty())
++    {
++#ifdef MACOSX
++        UnregisterCoreTextFont(rFileURL);
++#endif
+         return false;
++    }
+
+     FreetypeManager& rFreetypeManager = FreetypeManager::get();
+     for (auto const& nFontId : aFontIds)
+@@ -130,6 +144,10 @@ bool FreeTypeTextRenderImpl::AddTempDevFont(vcl::font::PhysicalFontCollection* p
+
+ bool FreeTypeTextRenderImpl::RemoveTempDevFont(const OUString& rFileURL, const OUString& /*rFontName*/)
+ {
++#ifdef MACOSX
++    UnregisterCoreTextFont(rFileURL);
++#endif
++
+     // inform PSP font manager
+     psp::PrintFontManager& rMgr = psp::PrintFontManager::get();
+     std::vector<psp::fontID> aFontIds = rMgr.findFontFileIDs(rFileURL);
+--- a/vcl/CppunitTest_vcl_font.mk
++++ b/vcl/CppunitTest_vcl_font.mk
+@@ -61,4 +61,11 @@ $(eval $(call gb_CppunitTest_use_more_fonts,vcl_font))
+
+ $(eval $(call gb_CppunitTest_set_non_application_font_use,vcl_font,abort))
+
++ifeq ($(OS),MACOSX)
++$(eval $(call gb_CppunitTest_use_system_darwin_frameworks,vcl_font,\
++	CoreFoundation \
++	CoreText \
++))
++endif
++
+ # vim: set noet sw=4 ts=4:
+--- a/vcl/qa/cppunit/font.cxx
++++ b/vcl/qa/cppunit/font.cxx
+@@ -13,6 +13,13 @@
+ #include <vcl/font.hxx>
+
+ #include <font/EmphasisMark.hxx>
++#ifdef MACOSX
++#include <quartz/CoreTextFontManager.hxx>
++
++#include <stdlib.h>
++#include <string>
++#include <unistd.h>
++#endif
+
+ class VclFontTest : public test::BootstrapFixture
+ {
+@@ -33,6 +40,9 @@ public:
+     void testEmphasisMarkInitAsDisc();
+     void testEmphasisMarkInitAsAccent();
+     void testEmphasisMarkInitAsStyle();
++#ifdef MACOSX
++    void testCoreTextFontDescriptorLookup();
++#endif
+
+     CPPUNIT_TEST_SUITE(VclFontTest);
+     CPPUNIT_TEST(testName);
+@@ -49,6 +59,9 @@ public:
+     CPPUNIT_TEST(testEmphasisMarkInitAsDisc);
+     CPPUNIT_TEST(testEmphasisMarkInitAsAccent);
+     CPPUNIT_TEST(testEmphasisMarkInitAsStyle);
++#ifdef MACOSX
++    CPPUNIT_TEST(testCoreTextFontDescriptorLookup);
++#endif
+     CPPUNIT_TEST_SUITE_END();
+ };
+
+@@ -212,6 +225,72 @@ void VclFontTest::testEmphasisMarkInitAsStyle()
+     CPPUNIT_ASSERT_EQUAL_MESSAGE("width wrong", tools::Long(0), aEmphasisMark.GetWidth());
+ }
+
++#ifdef MACOSX
++void VclFontTest::testCoreTextFontDescriptorLookup()
++{
++    // CoreText may resolve a path while Fontconfig keeps the symlink it scanned.
++    char selectedFilePath[] = "/tmp/vcl-font-test-XXXXXX";
++    const int fileDescriptor = mkstemp(selectedFilePath);
++    CPPUNIT_ASSERT(fileDescriptor >= 0);
++    CPPUNIT_ASSERT_EQUAL(0, close(fileDescriptor));
++    char duplicateFilePath[] = "/tmp/vcl-font-test-XXXXXX";
++    const int duplicateFileDescriptor = mkstemp(duplicateFilePath);
++    CPPUNIT_ASSERT(duplicateFileDescriptor >= 0);
++    CPPUNIT_ASSERT_EQUAL(0, close(duplicateFileDescriptor));
++    const std::string symlinkPath = std::string(selectedFilePath) + ".link";
++    CPPUNIT_ASSERT_EQUAL(0, symlink(selectedFilePath, symlinkPath.c_str()));
++
++    CFStringRef selectedFile = CFStringCreateWithCString(
++        nullptr, selectedFilePath, kCFStringEncodingUTF8);
++    CFStringRef symlinkFile = CFStringCreateWithCString(
++        nullptr, symlinkPath.c_str(), kCFStringEncodingUTF8);
++    CFStringRef duplicateFile = CFStringCreateWithCString(
++        nullptr, duplicateFilePath, kCFStringEncodingUTF8);
++    CFURLRef selectedURL = CFURLCreateWithFileSystemPath(
++        nullptr, selectedFile, kCFURLPOSIXPathStyle, false);
++    CPPUNIT_ASSERT(selectedURL != nullptr);
++
++    const void* attributeKeys[] = {
++        kCTFontURLAttribute, kCTFontFamilyNameAttribute, kCTFontStyleNameAttribute
++    };
++    const void* attributeValues[] = {
++        selectedURL, CFSTR("Selected Family"), CFSTR("Regular")
++    };
++    CFDictionaryRef attributes = CFDictionaryCreate(
++        nullptr, attributeKeys, attributeValues, 3, &kCFTypeDictionaryKeyCallBacks,
++        &kCFTypeDictionaryValueCallBacks);
++    CTFontDescriptorRef descriptor = CTFontDescriptorCreateWithAttributes(attributes);
++    CPPUNIT_ASSERT(descriptor != nullptr);
++    CFMutableDictionaryRef fonts = CFDictionaryCreateMutable(
++        nullptr, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++    CFDictionarySetValue(fonts, CFSTR("Selected-Regular"), descriptor);
++
++    CPPUNIT_ASSERT(FindCoreTextFontDescriptor(
++        fonts, CFSTR("Selected-Regular"), selectedFile,
++        CFSTR("Selected Family"), CFSTR("Regular")) == descriptor);
++    CPPUNIT_ASSERT(FindCoreTextFontDescriptor(
++        fonts, CFSTR("Selected-Regular"), symlinkFile,
++        CFSTR("Selected Family"), CFSTR("Regular")) == descriptor);
++    CPPUNIT_ASSERT(FindCoreTextFontDescriptor(
++        fonts, CFSTR("Variable-Name"), symlinkFile,
++        CFSTR("Selected Family"), CFSTR("Regular")) == descriptor);
++    CPPUNIT_ASSERT(FindCoreTextFontDescriptor(
++        fonts, CFSTR("Selected-Regular"), duplicateFile,
++        CFSTR("Selected Family"), CFSTR("Regular")) == nullptr);
++
++    CFRelease(fonts);
++    CFRelease(descriptor);
++    CFRelease(attributes);
++    CFRelease(selectedURL);
++    CFRelease(duplicateFile);
++    CFRelease(symlinkFile);
++    CFRelease(selectedFile);
++    CPPUNIT_ASSERT_EQUAL(0, unlink(symlinkPath.c_str()));
++    CPPUNIT_ASSERT_EQUAL(0, unlink(duplicateFilePath));
++    CPPUNIT_ASSERT_EQUAL(0, unlink(selectedFilePath));
++}
++#endif
++
+ CPPUNIT_TEST_SUITE_REGISTRATION(VclFontTest);
+
+ CPPUNIT_PLUGIN_IMPLEMENT();

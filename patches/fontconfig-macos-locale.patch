@@ -1,0 +1,27 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+--- a/external/fontconfig/ExternalProject_fontconfig.mk
++++ b/external/fontconfig/ExternalProject_fontconfig.mk
+@@ -22,0 +23,2 @@
++# Fontconfig's Autotools configure does not detect xlocale.h. macOS provides it, so define the
++# feature macro that activates the upstream locale compatibility patch in fcint.h.
+@@ -29,0 +32 @@
++			$(if $(filter MACOSX,$(OS)),-DHAVE_XLOCALE_H) \
+--- a/external/fontconfig/UnpackedTarball_fontconfig.mk
++++ b/external/fontconfig/UnpackedTarball_fontconfig.mk
+@@ -17,0 +18 @@ $(eval $(call gb_UnpackedTarball_add_patches,fontconfig,\
++	external/fontconfig/fontconfig-macos-locale.patch.0 \
+--- /dev/null
++++ b/external/fontconfig/fontconfig-macos-locale.patch.0
+@@ -0,0 +1,9 @@
++# Backport of https://gitlab.freedesktop.org/fontconfig/fontconfig/-/commit/c24472116967592c94a3be2c130adcc4e2750cf8
++# Fontconfig 2.18.0 predates this macOS locale compatibility fix.
++--- src/fcint.h
+++++ src/fcint.h
++@@ -58,0 +59,4 @@
+++#ifdef HAVE_XLOCALE_H
+++#include <xlocale.h>
+++#endif
+++

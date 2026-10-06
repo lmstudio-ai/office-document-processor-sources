@@ -1,0 +1,92 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+--- a/postprocess/Module_postprocess.mk
++++ b/postprocess/Module_postprocess.mk
+@@ -40,7 +40,10 @@
+ # contain content from at least one of external/more_fonts/fc_local.snippet
+ # (conditional on MORE_FONTS in BUILD_TYPE) and
+ # extras/source/truetype/symbol/fc_local.snippet (unconditional):
+-ifneq ($(USING_X11)$(DISABLE_GUI)$(filter ANDROID EMSCRIPTEN,$(OS)),)
++# "SVP" is LibreOffice's non-windowed renderer. It relies on Fontconfig to find fonts and choose
++# replacements when a document requests a font that is not installed. macOS sets neither USING_X11
++# nor DISABLE_GUI, so upstream skips this setup and background previews use the wrong fonts.
++ifneq ($(USING_X11)$(DISABLE_GUI)$(filter FONTCONFIG,$(BUILD_TYPE))$(filter ANDROID EMSCRIPTEN,$(OS)),)
+ $(eval $(call gb_Module_add_targets,postprocess, \
+     CustomTarget_fontconfig \
+     Package_fontconfig \
+--- a/external/libeot/ExternalProject_libeot.mk
++++ b/external/libeot/ExternalProject_libeot.mk
+@@ -15,0 +16,3 @@
++# Apple Silicon Clang miscompiles libeot's old MTX glyph decoder at -O2 and -Os,
++# corrupting embedded PowerPoint fonts. Limit only this external project to -O1;
++# the rest of LibreOffice retains the release build's normal optimization level.
+@@ -21 +24 @@
+-		&& $(gb_RUN_CONFIGURE) ./configure \
++		&& CFLAGS="$(CFLAGS) $(if $(filter MACOSX,$(OS)),-O1)" $(gb_RUN_CONFIGURE) ./configure \
+--- a/scp2/source/ooo/file_ooo.scp
++++ b/scp2/source/ooo/file_ooo.scp
+@@ -123,3 +123,7 @@
+ // user interface configuration files
++// Disabling scripting means LibreOffice never creates BasicIDE.filelist. The upstream packaging
++// step still requests the missing file, aborting the archive build unless this entry is gated.
++#ifndef DISABLE_SCRIPTING
+ UI_FILELIST(basicide, "UIConfig/modules/BasicIDE.filelist")
++#endif
+ UI_FILELIST(cui, "UIConfig/cui.filelist")
+--- a/slideshow/Library_slideshow.mk
++++ b/slideshow/Library_slideshow.mk
+@@ -29,4 +29,6 @@
+-
++# Turning off media playback clears AVMEDIA, but Impress slideshow code still calls shared
++# functions from the avmedia library. Treating it as optional causes unresolved symbols when
++# linking, so keep the core library linked even though media playback is disabled.
+ $(eval $(call gb_Library_use_libraries,slideshow,\
+-    $(call gb_Helper_optional,AVMEDIA,avmedia) \
++    avmedia \
+     basegfx \
+--- a/svl/Library_svl.mk
++++ b/svl/Library_svl.mk
+@@ -21,0 +22 @@
++# Curl is only used here for RFC 3161 timestamp requests, which no-network builds exclude.
+@@ -24 +25 @@
+-    $(if $(filter LINUX MACOSX ANDROID iOS %BSD SOLARIS HAIKU,$(OS)), \
++    $(if $(and $(ENABLE_CURL),$(filter LINUX MACOSX ANDROID iOS %BSD SOLARIS HAIKU,$(OS))), \
+--- a/svl/source/crypto/cryptosign.cxx
++++ b/svl/source/crypto/cryptosign.cxx
+@@ -17,0 +18,2 @@
++// The curl feature flag keeps upstream timestamping code out of no-network builds.
++#include <config_features.h>
+@@ -20 +22,2 @@
+-#if USE_CRYPTO_NSS
++// CurlInit is unavailable when curl support is omitted.
++#if USE_CRYPTO_NSS && HAVE_FEATURE_CURL
+@@ -50,0 +54,2 @@
++// RFC 3161 timestamp requests are the only curl user in this file.
++#if HAVE_FEATURE_CURL
+@@ -52,0 +58 @@
++#endif
+@@ -1055,0 +1062,8 @@
++// Reject timestamp-authority requests explicitly when curl is omitted.
++#if !HAVE_FEATURE_CURL
++    if (!m_aSignTSA.isEmpty())
++    {
++        SAL_WARN("svl.crypto", "PDF timestamping is unavailable because curl is disabled");
++        return false;
++    }
++#else
+@@ -1292,0 +1307 @@
++#endif
+--- a/uui/Library_uui.mk
++++ b/uui/Library_uui.mk
+@@ -19,0 +20,2 @@
++# Only the Windows OAuth interaction uses curl, so no-curl builds omit the dependency.
++ifneq ($(ENABLE_CURL),)
+@@ -20,0 +23 @@
++endif
+@@ -43,0 +47 @@
++# Keep the curl-backed Windows OAuth handler aligned with the optional dependency above.
+@@ -55 +59 @@
+-	$(if $(filter MSC,$(COM)),uui/source/iahndl-oauth2-win) \
++	$(if $(and $(ENABLE_CURL),$(filter MSC,$(COM))),uui/source/iahndl-oauth2-win) \

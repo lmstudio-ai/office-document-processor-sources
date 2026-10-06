@@ -1,0 +1,50 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+--- a/vcl/source/pdf/pdfwriter_impl2.cxx
++++ b/vcl/source/pdf/pdfwriter_impl2.cxx
+@@ -152,7 +152,9 @@
+             if( aNewBmpSize.Width() && aNewBmpSize.Height() )
+             {
+                 // #i121233# Use best quality for PDF exports
+-                aBitmap.Scale( aNewBmpSize, BmpScaleFlag::BestQuality );
++                // Previews are viewed at small sizes; bilinear is indistinguishable
++                // there and much cheaper than Lanczos (BestQuality).
++                aBitmap.Scale( aNewBmpSize, BmpScaleFlag::BiLinear );
+             }
+             else
+             {
+@@ -168,7 +170,10 @@
+     if( m_aContext.ColorMode == PDFWriter::DrawGreyscale )
+         aBitmap.Convert(BmpConversion::N8BitGreys);
+     bool bUseJPGCompression = !i_rContext.m_bOnlyLosslessCompression;
+-    if ( bIsPng || ( aSizePixel.Width() < 32 ) || ( aSizePixel.Height() < 32 ) )
++    // Large PNG-sourced images are far cheaper as JPEG+SMask than zlib-compressed
++    // DIB; keep the lossless path only for small graphics.
++    const bool bLargeImage = aSizePixel.Width() >= 256 && aSizePixel.Height() >= 256;
++    if ( ( bIsPng && !bLargeImage ) || ( aSizePixel.Width() < 32 ) || ( aSizePixel.Height() < 32 ) )
+         bUseJPGCompression = false;
+
+     auto   pStrm=std::make_shared<SvMemoryStream>();
+@@ -191,7 +196,10 @@
+             }
+         }
+         sal_uInt32 nZippedFileSize = 0; // sj: we will calculate the filesize of a zipped bitmap
+-        if ( !bIsJpeg )                 // to determine if jpeg compression is useful
++        // For large bitmaps JPEG essentially always beats zlib-compressed DIB, so skip
++        // the probe (it deflates the whole bitmap just to compare sizes).
++        const bool bSkipZippedSizeProbe = bLargeImage;
++        if ( !bIsJpeg && !bSkipZippedSizeProbe ) // to determine if jpeg compression is useful
+         {
+             SvMemoryStream aTemp;
+             aTemp.SetCompressMode( aTemp.GetCompressMode() | SvStreamCompressFlags::ZBITMAP );
+@@ -223,7 +231,7 @@
+             };
+             xGraphicProvider->storeGraphic( xGraphic, aOutMediaProperties );
+             xOut->flush();
+-            if ( !bIsJpeg && xSeekable->getLength() > nZippedFileSize )
++            if ( !bIsJpeg && !bSkipZippedSizeProbe && xSeekable->getLength() > nZippedFileSize )
+             {
+                 bUseJPGCompression = false;
+             }

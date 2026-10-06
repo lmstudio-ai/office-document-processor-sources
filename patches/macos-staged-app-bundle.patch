@@ -1,0 +1,39 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+--- a/configure.ac
++++ b/configure.ac
+@@ -1090,7 +1090,9 @@
+         AC_MSG_NOTICE([sanitized the PATH to $PATH])
+     fi
+     _os=Darwin
+-    INSTROOTBASESUFFIX=/$PRODUCTNAME_WITHOUT_SPACES.app
++    # Keep the build tree from becoming an app bundle while linkers still write to it. macOS
++    # otherwise requires App Management approval as soon as it recognizes the partial bundle.
++    INSTROOTBASESUFFIX=/$PRODUCTNAME_WITHOUT_SPACES-staging
+     INSTROOTCONTENTSUFFIX=/Contents
+     SDKDIRNAME=${PRODUCTNAME_WITHOUT_SPACES}${PRODUCTVERSION}_SDK
+     # See "Default values, as such probably valid just for Linux" comment above the case "$host_os"
+--- a/scp2/source/ooo/directory_ooo_macosx.scp
++++ b/scp2/source/ooo/directory_ooo_macosx.scp
+@@ -21,5 +21,7 @@
+ #ifdef MACOSX
+ Directory gid_Dir_Bundle
+     ParentID = PD_PROGDIR;
+-    HostName = "%ONEWORDPRODUCTNAME.app";
++    // The extension-pack pipeline publishes the completed, signed bundle under its final .app
++    // name. Keeping installer staging neutral avoids the same App Management gate during packing.
++    HostName = "%ONEWORDPRODUCTNAME-staging";
+ End
+--- a/sysui/Package_infoplist.mk
++++ b/sysui/Package_infoplist.mk
+@@ -15 +15 @@
+-$(eval $(call gb_Package_add_files,infoplist,$(PRODUCTNAME_WITHOUT_SPACES).app/Contents,\
++$(eval $(call gb_Package_add_files,infoplist,$(PRODUCTNAME_WITHOUT_SPACES)-staging/Contents,\
+@@ -21 +21 @@
+-$(eval $(call gb_Package_add_files,infoplist,$(PRODUCTNAME_WITHOUT_SPACES).app/Contents/Resources/$(lang).lproj,\
++$(eval $(call gb_Package_add_files,infoplist,$(PRODUCTNAME_WITHOUT_SPACES)-staging/Contents/Resources/$(lang).lproj,\
+@@ -25 +25 @@
+-$(eval $(call gb_Package_add_empty_directory,infoplist,$(PRODUCTNAME_WITHOUT_SPACES).app/Contents/Resources/en.lproj))
++$(eval $(call gb_Package_add_empty_directory,infoplist,$(PRODUCTNAME_WITHOUT_SPACES)-staging/Contents/Resources/en.lproj))

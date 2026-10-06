@@ -1,0 +1,27 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+diff --git a/configure.ac b/configure.ac
+index 4d4c78e..3ccdfb9 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -369,6 +369,8 @@ if test -n "$WSL_DISTRO_NAME" && $(echo $PATH |grep -q -e mingw64 -e clangarm64
+         [],
+         [with_wsl_command="wsl.exe"])
+-    WSL="$with_wsl_command"
++    # Native make does not reliably inherit Git Bash's System32 lookup, so keep
++    # every generated WSL invocation independent of PATH.
++    WSL="/c/Windows/system32/$with_wsl_command"
+ fi
+ AC_SUBST([STRAWBERRY_PERL])
+ AC_SUBST([WSL])
+@@ -16251,7 +16253,7 @@ if test -n "$WSL_ONLY_AS_HELPER"; then
+     NASM="$WSL $NASM"
+     # some externals (libebook) check for it with AC_PATH_PROGS, and that only accepts overrides
+     # with an absolute path/requires the value to begin with a slash
+-    GPERF="/c/Windows/system32/$WSL gperf"
++    GPERF="$WSL gperf"
+     # append strawberry tools dir to PATH (for e.g. windres, ar)
+     LO_PATH="$LO_PATH:$STRAWBERRY_TOOLS"
+     # temp-dir needs to be in windows realm, hardcode for now

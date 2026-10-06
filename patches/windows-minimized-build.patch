@@ -1,0 +1,230 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+diff --git a/basic/Library_sb.mk b/basic/Library_sb.mk
+--- a/basic/Library_sb.mk
++++ b/basic/Library_sb.mk
+@@ -41,6 +41,12 @@ $(eval $(call gb_Library_add_defs,sb,\
+ 	-DBASIC_DLLIMPLEMENTATION \
+ ))
+ 
++ifeq ($(filter SCRIPTING,$(BUILD_TYPE)),)
++$(eval $(call gb_Library_add_defs,sb,\
++	-DBASIC_NO_SCRIPTING_EXPORTS \
++))
++endif
++
+ $(eval $(call gb_Library_use_libraries,sb,\
+ 	comphelper \
+ 	cppu \
+diff --git a/dbaccess/source/core/dataaccess/databasecontext.cxx b/dbaccess/source/core/dataaccess/databasecontext.cxx
+--- a/dbaccess/source/core/dataaccess/databasecontext.cxx
++++ b/dbaccess/source/core/dataaccess/databasecontext.cxx
+@@ -701,6 +701,7 @@ void ODatabaseContext::databaseDocumentURLChange(const OUString& _rOldURL, const OUString& _rNewURL)
+     m_aDatabaseObjects.erase( oldPos );
+ }
+ 
++#if HAVE_FEATURE_SCRIPTING
+ void ODatabaseContext::onBasicManagerCreated( const Reference< XModel >& _rxForDocument, BasicManager& _rBasicManager )
+ {
+ #if !HAVE_FEATURE_SCRIPTING
+@@ -722,6 +723,7 @@ void ODatabaseContext::onBasicManagerCreated( const Reference< XModel >& _rxForDocument, BasicManager& _rBasicManager )
+     _rBasicManager.SetGlobalUNOConstant( u"ThisDatabaseDocument"_ustr, Any( xDatabaseDocument ) );
+ #endif
+ }
++#endif
+ 
+ }   // namespace dbaccess
+ 
+diff --git a/dbaccess/source/core/inc/databasecontext.hxx b/dbaccess/source/core/inc/databasecontext.hxx
+--- a/dbaccess/source/core/inc/databasecontext.hxx
++++ b/dbaccess/source/core/inc/databasecontext.hxx
+@@ -47,7 +47,9 @@ typedef ::cppu::WeakComponentImplHelper<   css::lang::XServiceInfo
+                                        >   DatabaseAccessContext_Base;
+ 
+ class ODatabaseContext  :public DatabaseAccessContext_Base
++#if HAVE_FEATURE_SCRIPTING
+                         ,public ::basic::BasicManagerCreationListener
++#endif
+ {
+ private:
+     /** loads the given object from the given URL
+@@ -149,11 +151,13 @@ private:
+     void removeFromTerminateListener(const ODatabaseModelImpl& _rDataSourceModel);
+ 
+ private:
++#if HAVE_FEATURE_SCRIPTING
+     // BasicManagerCreationListener
+     virtual void onBasicManagerCreated(
+         const css::uno::Reference< css::frame::XModel >& _rxForDocument,
+         BasicManager& _rBasicManager
+     ) override;
++#endif
+ };
+ 
+ }   // namespace dbaccess
+diff --git a/include/basic/basicdllapi.h b/include/basic/basicdllapi.h
+--- a/include/basic/basicdllapi.h
++++ b/include/basic/basicdllapi.h
+@@ -15,5 +15,11 @@
+ #define BASIC_DLLPUBLIC SAL_DLLPUBLIC_IMPORT
+ #endif
+ #define BASIC_DLLPRIVATE SAL_DLLPRIVATE
++#if defined(BASIC_NO_SCRIPTING_EXPORTS)
++// MSVC otherwise emits vtables for scripting classes whose implementations were omitted.
++#define BASIC_SCRIPTING_DLLPUBLIC
++#else
++#define BASIC_SCRIPTING_DLLPUBLIC BASIC_DLLPUBLIC
++#endif
+ 
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/include/basic/sbmod.hxx b/include/basic/sbmod.hxx
+--- a/include/basic/sbmod.hxx
++++ b/include/basic/sbmod.hxx
+@@ -48,6 +48,6 @@ struct SbClassData;
+ 
+-class BASIC_DLLPUBLIC SbModule : public SbxObject
++class BASIC_SCRIPTING_DLLPUBLIC SbModule : public SbxObject
+ {
+     friend class    SbiCodeGen;
+     friend class    SbMethod;
+     friend class    SbiRuntime;
+@@ -142,7 +142,7 @@ typedef tools::SvRef<SbModule> SbModuleRef;
+ typedef std::vector<SbModuleRef> SbModules;
+ 
+ // Object class for instances of class modules
+-class UNLESS_MERGELIBS(BASIC_DLLPUBLIC) SbClassModuleObject final : public SbModule
++class UNLESS_MERGELIBS(BASIC_SCRIPTING_DLLPUBLIC) SbClassModuleObject final : public SbModule
+ {
+     SbModule&   mrClassModule;
+     bool        mbInitializeEventDone;
+diff --git a/include/basic/sbmeth.hxx b/include/basic/sbmeth.hxx
+--- a/include/basic/sbmeth.hxx
++++ b/include/basic/sbmeth.hxx
+@@ -26,8 +26,8 @@
+ class ErrCode;
+ class SbModule;
+ 
+-class BASIC_DLLPUBLIC SbMethod : public SbxMethod
++class BASIC_SCRIPTING_DLLPUBLIC SbMethod : public SbxMethod
+ {
+     friend class SbiRuntime;
+     friend class SbiFactory;
+     friend class SbModule;
+diff --git a/include/basic/sbstar.hxx b/include/basic/sbstar.hxx
+--- a/include/basic/sbstar.hxx
++++ b/include/basic/sbstar.hxx
+@@ -35,6 +35,6 @@ class ErrCodeMsg;
+ class SbMethod;
+ 
+-class BASIC_DLLPUBLIC StarBASIC final : public SbxObject
++class BASIC_SCRIPTING_DLLPUBLIC StarBASIC final : public SbxObject
+ {
+     friend class SbiScanner;
+     friend class SbiExpression; // Access to RTL
+diff --git a/sfx2/source/appl/appdata.cxx b/sfx2/source/appl/appdata.cxx
+--- a/sfx2/source/appl/appdata.cxx
++++ b/sfx2/source/appl/appdata.cxx
+@@ -43,6 +43,7 @@ using ::com::sun::star::uno::XInterface;
+ 
+ static BasicDLL* pBasic = nullptr;
+ 
++#if HAVE_FEATURE_SCRIPTING
+ class SfxBasicManagerCreationListener : public ::basic::BasicManagerCreationListener
+ {
+ private:
+@@ -67,7 +68,8 @@ void SfxBasicManagerCreationListener::onBasicManagerCreated( const Reference< XModel >& _rxForDocument, BasicManager& _rBasicManager )
+ {
+     if ( _rxForDocument == nullptr )
+         m_rAppData.OnApplicationBasicManagerCreated( _rBasicManager );
+ }
++#endif
+ 
+ SfxAppData_Impl::SfxAppData_Impl()
+     : pPool(nullptr)
+@@ -75,7 +77,9 @@ SfxAppData_Impl::SfxAppData_Impl()
+     , nDocModalMode(0)
+     , nRescheduleLocks(0)
+     , pBasicManager( new SfxBasicManagerHolder )
++#if HAVE_FEATURE_SCRIPTING
+     , pBasMgrListener( new SfxBasicManagerCreationListener( *this ) )
++#endif
+     , pViewFrame( nullptr )
+     , bDowning( true )
+     , bInQuit( false )
+diff --git a/sfx2/source/inc/appdata.hxx b/sfx2/source/inc/appdata.hxx
+--- a/sfx2/source/inc/appdata.hxx
++++ b/sfx2/source/inc/appdata.hxx
+@@ -97,8 +97,10 @@ public:
+     std::vector<SfxObjectShell*>
+                                 maObjShells;
+     std::unique_ptr<SfxBasicManagerHolder>
+                                 pBasicManager;
++#if HAVE_FEATURE_SCRIPTING
+     std::unique_ptr<SfxBasicManagerCreationListener>
+                                 pBasMgrListener;
++#endif
+     SfxViewFrame*               pViewFrame;
+     std::optional<SfxSlotPool>  pSlotPool;
+diff --git a/sc/source/core/data/formulacell.cxx b/sc/source/core/data/formulacell.cxx
+--- a/sc/source/core/data/formulacell.cxx
++++ b/sc/source/core/data/formulacell.cxx
+@@ -5139,7 +5139,7 @@
+ 
+     int nMaxGroupLength = INT_MAX;
+ 
+-#ifdef _WIN32
++#if defined(_WIN32) && HAVE_FEATURE_OPENCL
+     // Heuristic: Certain old low-end OpenCL implementations don't
+     // work for us with too large group lengths. 1000 was determined
+     // empirically to be a good compromise.
+diff --git a/svx/source/svdraw/svdomedia.cxx b/svx/source/svdraw/svdomedia.cxx
+--- a/svx/source/svdraw/svdomedia.cxx
++++ b/svx/source/svdraw/svdomedia.cxx
+@@ -72,7 +72,9 @@ struct SdrMediaObj::Impl
+     std::shared_ptr< ::avmedia::MediaTempFile >  m_pTempFile;
+ #endif
+     uno::Reference< graphic::XGraphic >   m_xCachedSnapshot;
++#if HAVE_FEATURE_AVMEDIA
+     rtl::Reference<avmedia::PlayerListener> m_xPlayerListener;
++#endif
+     OUString m_LastFailedPkgURL;
+     // owned by the link manager while registered, null otherwise
+     SdrMediaLink* m_pMediaLink = nullptr;
+diff --git a/sd/source/ui/inc/View.hxx b/sd/source/ui/inc/View.hxx
+--- a/sd/source/ui/inc/View.hxx
++++ b/sd/source/ui/inc/View.hxx
+@@ -19,6 +19,7 @@
+ 
+ #pragma once
+ 
++#include <config_features.h>
+ #include <memory>
+ #include <pres.hxx>
+ #include <tools/gen.hxx>
+@@ -268,6 +269,8 @@ private:
+     sal_Int8                mnAction;
+     Idle                    maDropErrorIdle;
+     Idle                    maDropInsertFileIdle;
++#if HAVE_FEATURE_AVMEDIA
+     rtl::Reference<avmedia::PlayerListener> mxDropMediaSizeListener;
++#endif
+     sal_uInt16              mnLockRedrawSmph;
+     bool                    mbIsDropAllowed;
+diff --git a/scp2/source/base/postgresqlsdbc.scp b/scp2/source/base/postgresqlsdbc.scp
+--- a/scp2/source/base/postgresqlsdbc.scp
++++ b/scp2/source/base/postgresqlsdbc.scp
+@@ -9,10 +9,10 @@
+ 
+ #include "macros.inc"
+ 
+-#include "AutoInstall/postgresqlsdbc"
+-
+ #if defined WITH_POSTGRESQL_SDBC
+ 
++#include "AutoInstall/postgresqlsdbc"
++
+ Module gid_Module_Optional_PostgresqlSdbc
+     PackageInfo = "packinfo_office.txt";
+     MOD_NAME_DESC(MODULE_OPTIONAL_POSTGRESQLSDBC);

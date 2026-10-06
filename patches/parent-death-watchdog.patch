@@ -1,0 +1,86 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+--- a/desktop/source/app/main.c
++++ b/desktop/source/app/main.c
+@@ -21,0 +22,72 @@
++#if defined(MACOSX) || defined(LINUX)
++#include <limits.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++static pid_t gExpectedParentProcessId;
++
++static int enter_ipc_working_directory(void)
++{
++    const char* ipcWorkingDirectory = getenv("LIBREOFFICE_IPC_WORKING_DIRECTORY");
++
++    /* App Sandbox resets soffice's working directory to the container root. Enter the private
++       listener directory here so its relative pipe name stays short and isolated. */
++    if (ipcWorkingDirectory != NULL && chdir(ipcWorkingDirectory) != 0)
++    {
++        return 1;
++    }
++    return 0;
++}
++
++static void* parent_death_watchdog(void* unused)
++{
++    (void)unused;
++    while (getppid() == gExpectedParentProcessId)
++    {
++        sleep(1);
++    }
++
++    /* This runtime is an Electron-owned listener. If Electron disappears without a normal
++       shutdown, exit the whole process instead of leaving an orphaned office service. */
++    _exit(0);
++}
++
++static int start_parent_death_watchdog(void)
++{
++    const char* enabled = getenv("LMSTUDIO_OFFICE_PARENT_DEATH_WATCHDOG");
++    const char* expectedParentProcessId = getenv("LMSTUDIO_OFFICE_PARENT_PID");
++    char* expectedParentProcessIdEnd;
++    long parsedExpectedParentProcessId;
++    pthread_t thread;
++
++    if (enabled == NULL || strcmp(enabled, "1") != 0)
++    {
++        return 0;
++    }
++    if (expectedParentProcessId == NULL || *expectedParentProcessId == '\0')
++    {
++        return 1;
++    }
++
++    parsedExpectedParentProcessId = strtol(expectedParentProcessId, &expectedParentProcessIdEnd, 10);
++    if (*expectedParentProcessIdEnd != '\0' || parsedExpectedParentProcessId <= 1 ||
++        parsedExpectedParentProcessId > INT_MAX)
++    {
++        return 1;
++    }
++    gExpectedParentProcessId = (pid_t)parsedExpectedParentProcessId;
++    if (getppid() != gExpectedParentProcessId)
++    {
++        return 1;
++    }
++    if (pthread_create(&thread, NULL, parent_death_watchdog, NULL) != 0)
++    {
++        return 1;
++    }
++    pthread_detach(thread);
++    return 0;
++}
++#endif
++
+@@ -50,0 +123,6 @@
++#if defined(MACOSX) || defined(LINUX)
++    if (enter_ipc_working_directory() != 0 || start_parent_death_watchdog() != 0)
++    {
++        return 1;
++    }
++#endif

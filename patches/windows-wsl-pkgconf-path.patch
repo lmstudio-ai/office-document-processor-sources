@@ -1,0 +1,23 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+diff --git a/configure.ac b/configure.ac
+index 4d4c78e..2301120 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -7077,7 +7077,12 @@ dnl ===================================================================
+ # pkgconf/pkg-config detection is already triggered by the configure switches way above
+ # (more specifically PKG_CHECK_MODULES), so only do some cleanup of the vars here
+-PathFormat "$(command -v $PKG_CONFIG)"
+-PKG_CONFIG="$formatted_path"
++if test -n "$WSL_ONLY_AS_HELPER"; then
++    # WSL and native make share PATH, but neither can execute the other's absolute path form.
++    PKG_CONFIG=$(basename "$PKG_CONFIG")
++else
++    PathFormat "$(command -v $PKG_CONFIG)"
++    PKG_CONFIG="$formatted_path"
++fi
+ AC_SUBST(PKG_CONFIG)
+ AC_SUBST(PKG_CONFIG_PATH)
+ AC_SUBST(PKG_CONFIG_LIBDIR)

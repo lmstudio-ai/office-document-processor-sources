@@ -1,0 +1,25 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+diff --git a/external/harfbuzz/ExternalProject_harfbuzz.mk b/external/harfbuzz/ExternalProject_harfbuzz.mk
+index 98ae5b9..d15bba2 100644
+--- a/external/harfbuzz/ExternalProject_harfbuzz.mk
++++ b/external/harfbuzz/ExternalProject_harfbuzz.mk
+@@ -45,12 +45,16 @@ endef
+ 
+ # cannot use CROSS_COMPILING as condition since we have cross-compilation "light" for cases where
+ # the builder can run the host binaries, like for example when compiling for win 32bit on win 64bit
++# Meson's setup and compile commands each need VS's semicolon-separated paths.
+ $(call gb_ExternalProject_get_state_target,harfbuzz,build) : | $(call gb_ExternalExecutable_get_dependencies,python)
+ 	$(call gb_Trace_StartRange,harfbuzz,EXTERNAL)
+ 	$(file >$(gb_UnpackedTarball_workdir)/harfbuzz/cross-file.txt,$(gb_harfbuzz_cross_compile))
+ 	$(call gb_ExternalProject_run,build,\
+ 		PKG_CONFIG_PATH="${PKG_CONFIG_PATH}$(LIBO_PATH_SEPARATOR)$(gb_UnpackedTarball_workdir)/graphite$(if $(SYSTEM_ICU),,$(LIBO_PATH_SEPARATOR)$(gb_UnpackedTarball_workdir)/icu)" \
+ 		PYTHONWARNINGS= \
++		INCLUDE="$(LIBREOFFICE_MSVC_INCLUDE)" \
++		LIB="$(LIBREOFFICE_MSVC_LIB)" \
++		export PKG_CONFIG_PATH PYTHONWARNINGS INCLUDE LIB && \
+ 		$(MESON) setup --wrap-mode nofallback builddir \
+ 			-Ddefault_library=static -Dbuildtype=$(if $(ENABLE_DBGUTIL),debug,$(if $(ENABLE_DEBUG),debugoptimized,release \
+ 			$(if $(call gb_Module__symbols_enabled,harfbuzz),$(addsuffix "$(strip $(gb_DEBUGINFO_FLAGS))",-Dc_args= -Dcpp_args=)))) \

@@ -1,0 +1,73 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+--- a/sal/osl/unx/pipe.cxx
++++ b/sal/osl/unx/pipe.cxx
+@@ -16,6 +16,7 @@
+  */
+
+ #include <cassert>
++#include <cstdlib>
+ #include <cstring>
+ #include <fcntl.h>
+ #include <sys/stat.h>
+@@ -141,12 +142,25 @@ static oslPipe osl_psz_createPipe(const char *pszPipeName, oslPipeOptions Options,
+     OString name;
+     oslPipe pPipe;
+
+-    if (access(PIPEDEFAULTPATH.getStr(), W_OK) == 0)
+-        name = PIPEDEFAULTPATH;
+-    else if (access(PIPEALTERNATEPATH.getStr(), W_OK) == 0)
+-        name = PIPEALTERNATEPATH;
+-    else {
+-        name = getBootstrapSocketPath ();
+-    }
++    // The App Sandbox blocks LibreOffice's global temporary socket directories. Let the
++    // launcher select a writable directory in the shared App Group; the desktop forwarding
++    // client uses the same override below so both sides resolve the same named pipe.
++    const char* ipcDirectory = std::getenv("LIBREOFFICE_IPC_DIRECTORY");
++    if (ipcDirectory != nullptr && access(ipcDirectory, W_OK) == 0)
++    {
++        name = OString(ipcDirectory);
++    }
++    else if (access(PIPEDEFAULTPATH.getStr(), W_OK) == 0)
++    {
++        name = PIPEDEFAULTPATH;
++    }
++    else if (access(PIPEALTERNATEPATH.getStr(), W_OK) == 0)
++    {
++        name = PIPEALTERNATEPATH;
++    }
++    else
++    {
++        name = getBootstrapSocketPath ();
++    }
+
+     name += "/";
+--- a/desktop/unx/source/start.c
++++ b/desktop/unx/source/start.c
+@@ -257,6 +257,7 @@ static rtl_uString *get_pipe_path(rtl_uString *pAppPath)
+ {
+     rtl_uString *pPath = NULL, *pTmp = NULL, *pUserInstallation = NULL;
+     rtl_uString *pResult = NULL, *pBasePath = NULL, *pAbsUserInstallation = NULL;
++    const char *pIpcDirectory = getenv("LIBREOFFICE_IPC_DIRECTORY");
+     rtlBootstrapHandle handle;
+     rtl_uString *pMd5hash = NULL;
+     sal_Unicode pUnicode[RTL_USTR_MAX_VALUEOFINT32];
+@@ -284,7 +285,14 @@ static rtl_uString *get_pipe_path(rtl_uString *pAppPath)
+     if (!pMd5hash)
+         rtl_uString_new(&pMd5hash);
+
+-    if (access(PIPEDEFAULTPATH, W_OK) == 0)
++    /* Match osl_createPipe's sandbox-safe override. Without this, a second soffice invocation
++       looks in the global temporary directory and cannot find the listener created inside the
++       shared App Group. */
++    if (pIpcDirectory && access(pIpcDirectory, W_OK) == 0)
++    {
++        rtl_uString_newFromAscii(&pResult, pIpcDirectory);
++    }
++    else if (access(PIPEDEFAULTPATH, W_OK) == 0)
+     {
+         rtl_uString_newFromAscii(&pResult, PIPEDEFAULTPATH);
+     }

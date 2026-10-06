@@ -1,0 +1,136 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+diff --git a/filter/source/pdf/pdfexport.cxx b/filter/source/pdf/pdfexport.cxx
+index c70cb599c..e7ca08eae 100644
+--- a/filter/source/pdf/pdfexport.cxx
++++ b/filter/source/pdf/pdfexport.cxx
+@@ -84,11 +84,13 @@ using namespace ::com::sun::star::view;
+ PDFExport::PDFExport( const Reference< XComponent >& rxSrcDoc,
+                       const Reference< task::XStatusIndicator >& rxStatusIndicator,
+                       const Reference< task::XInteractionHandler >& rxIH,
+-                      const Reference< XComponentContext >& xContext ) :
++                      const Reference< XComponentContext >& xContext,
++                      const std::atomic_bool& rCancelled ) :
+     mxSrcDoc                    ( rxSrcDoc ),
+     mxContext                   ( xContext ),
+     mxStatusIndicator           ( rxStatusIndicator ),
+     mxIH                        ( rxIH ),
++    mrCancelled                 ( rCancelled ),
+     mbUseLosslessCompression    ( false ),
+     mbReduceImageResolution     ( true ),
+     mbSkipEmptyPages            ( true ),
+@@ -149,6 +151,11 @@ bool PDFExport::ExportSelection( vcl::pdf::PDFWriter& rPDFWriter,
+                 StringRangeEnumerator::Iterator aEnd  = rRangeEnum.end();
+                 while ( aIter != aEnd )
+                 {
++                    if (mrCancelled.load(std::memory_order_relaxed))
++                    {
++                        return false;
++                    }
++
+                     const Sequence< PropertyValue > aRenderer( rRenderable->getRenderer( *aIter, rSelection, rRenderOptions ) );
+                     awt::Size                   aPageSize;
+ 
+@@ -1189,6 +1196,11 @@ bool PDFExport::Export( const OUString& rFile, const Sequence< PropertyValue >&
+                 if( !rLoc.Language.isEmpty() )
+                     aPDFWriter.SetDocumentLocale( rLoc );
+ 
++                if (mrCancelled.load(std::memory_order_relaxed))
++                {
++                    bRet = false;
++                }
++
+                 if( bRet )
+                 {
+                     aPDFExtOutDevData.PlayGlobalActions( aPDFWriter );
+diff --git a/filter/source/pdf/pdfexport.hxx b/filter/source/pdf/pdfexport.hxx
+index 8e6a8cd6b..001b169b3 100644
+--- a/filter/source/pdf/pdfexport.hxx
++++ b/filter/source/pdf/pdfexport.hxx
+@@ -19,6 +19,8 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++
+ #include <tools/multisel.hxx>
+ #include <vcl/pdfwriter.hxx>
+ #include <vcl/pdfextoutdevdata.hxx>
+@@ -41,6 +43,7 @@ private:
+     css::uno::Reference< css::uno::XComponentContext > mxContext;
+     css::uno::Reference< css::task::XStatusIndicator > mxStatusIndicator;
+     css::uno::Reference< css::task::XInteractionHandler > mxIH;
++    const std::atomic_bool& mrCancelled;
+ 
+     bool                mbUseLosslessCompression;
+     bool                mbReduceImageResolution;
+@@ -72,7 +75,8 @@ public:
+                         PDFExport(  const css::uno::Reference< css::lang::XComponent >& rxSrcDoc,
+                                     const css::uno::Reference< css::task::XStatusIndicator >& xStatusIndicator,
+                                     const css::uno::Reference< css::task::XInteractionHandler >& xIH,
+-                                    const css::uno::Reference< css::uno::XComponentContext >& xFact );
++                                    const css::uno::Reference< css::uno::XComponentContext >& xFact,
++                                    const std::atomic_bool& rCancelled );
+                         ~PDFExport();
+ 
+     bool                ExportSelection( vcl::pdf::PDFWriter& rPDFWriter,
+diff --git a/filter/source/pdf/pdffilter.cxx b/filter/source/pdf/pdffilter.cxx
+index da0c90764..10d96cedf 100644
+--- a/filter/source/pdf/pdffilter.cxx
++++ b/filter/source/pdf/pdffilter.cxx
+@@ -175,12 +175,17 @@ bool PDFFilter::implExport( const Sequence< PropertyValue >& rDescriptor )
+ 
+     if( mxSrcDoc.is() && xOStm.is() )
+     {
+-        PDFExport       aExport( mxSrcDoc, xStatusIndicator, xIH, mxContext );
++        PDFExport       aExport( mxSrcDoc, xStatusIndicator, xIH, mxContext, mbCancelled );
+         ::utl::TempFileNamed aTempFile;
+ 
+         aTempFile.EnableKillingFile();
+         bRet = aExport.Export( aTempFile.GetURL(), aFilterData );
+ 
++        if (mbCancelled.load(std::memory_order_relaxed))
++        {
++            bRet = false;
++        }
++
+         if( bRet )
+         {
+             std::unique_ptr<SvStream> pIStm(::utl::UcbStreamHelper::CreateStream( aTempFile.GetURL(), StreamMode::READ ));
+@@ -254,11 +259,13 @@ sal_Bool SAL_CALL PDFFilter::filter( const Sequence< PropertyValue >& rDescripto
+ 
+ void SAL_CALL PDFFilter::cancel( )
+ {
++    mbCancelled.store(true, std::memory_order_relaxed);
+ }
+ 
+ 
+ void SAL_CALL PDFFilter::setSourceDocument( const Reference< XComponent >& xDoc )
+ {
++    mbCancelled.store(false, std::memory_order_relaxed);
+     mxSrcDoc = xDoc;
+ }
+ 
+diff --git a/filter/source/pdf/pdffilter.hxx b/filter/source/pdf/pdffilter.hxx
+index 28869272c..dca6f990e 100644
+--- a/filter/source/pdf/pdffilter.hxx
++++ b/filter/source/pdf/pdffilter.hxx
+@@ -19,6 +19,8 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++
+ #include <com/sun/star/document/XFilter.hpp>
+ #include <com/sun/star/document/XExporter.hpp>
+ #include <com/sun/star/lang/XInitialization.hpp>
+@@ -40,6 +42,7 @@ private:
+ 
+     Reference< XComponentContext >  mxContext;
+     Reference< XComponent >         mxSrcDoc;
++    std::atomic_bool                 mbCancelled{ false };
+ 
+     bool                            implExport( const Sequence< PropertyValue >& rDescriptor );
+ 

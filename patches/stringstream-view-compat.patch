@@ -1,0 +1,22 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+# Backport of https://github.com/LibreOffice/core/commit/8a83f97e8a311063853754026b048acbbc947abb
+# Xcode 15.2's libc++ does not provide C++20 std::stringstream::view().
+--- a/svx/source/svdraw/svdmrkv.cxx
++++ b/svx/source/svdraw/svdmrkv.cxx
+@@ -1229,11 +1229,11 @@ void SdrMarkView::SetMarkHandlesForLOKit(tools::Rectangle const & rRect, const S
+                 responseJSON.add_child("kinds", nodes);
+                 std::stringstream aStream;
+                 boost::property_tree::write_json(aStream, responseJSON, /*pretty=*/ false);
+-                handleArrayStr = OString::Concat(", \"handles\":") + aStream.view();
++                handleArrayStr = OString::Concat(", \"handles\":") + aStream.str().c_str();
+                 if (bConnectorSelection)
+                 {
+                     aStream.str("");
+                     boost::property_tree::write_json(aStream, aGluePointsTree, /*pretty=*/ false);
+-                    handleArrayStr += OString::Concat(", \"GluePoints\":") + aStream.view();
++                    handleArrayStr += OString::Concat(", \"GluePoints\":") + aStream.str().c_str();
+                 }
+             }

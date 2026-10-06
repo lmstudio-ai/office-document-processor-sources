@@ -1,0 +1,38 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+diff --git a/desktop/source/app/officeipcthread.cxx b/desktop/source/app/officeipcthread.cxx
+--- a/desktop/source/app/officeipcthread.cxx
++++ b/desktop/source/app/officeipcthread.cxx
+@@ -661,13 +661,15 @@ void RequestHandler::RequestsCompleted()
+     }
+ }
+ 
++// Starts or joins the request relay used by normal interactive LibreOffice processes.
+ RequestHandler::Status RequestHandler::Enable(bool ipc)
+ {
+     ::osl::MutexGuard   aGuard( GetMutex() );
+ 
+     if( pGlobal.is() )
+         return IPC_STATUS_OK;
+ 
+-#if !HAVE_FEATURE_DESKTOP || HAVE_FEATURE_MACOSX_SANDBOX || defined(EMSCRIPTEN)
++    // The dedicated listener is controlled through UNO, so command-line forwarding stays off.
++#if !HAVE_FEATURE_DESKTOP || HAVE_FEATURE_MACOSX_SANDBOX || defined(_WIN32) || defined(EMSCRIPTEN)
+     ipc = false;
+ #endif
+ 
+diff --git a/sal/osl/w32/pipe.cxx b/sal/osl/w32/pipe.cxx
+--- a/sal/osl/w32/pipe.cxx
++++ b/sal/osl/w32/pipe.cxx
+@@ -39,7 +39,8 @@
+ #include <cassert>
+ #include <string.h>
+ 
+-#define PIPESYSTEM      "\\\\.\\pipe\\"
++// Windows only permits named pipes below LOCAL when this runtime is inside an AppContainer.
++#define PIPESYSTEM      "\\\\.\\pipe\\LOCAL\\"
+ #define PIPEPREFIX      "OSL_PIPE_"
+ 
+ struct oslPipeImpl

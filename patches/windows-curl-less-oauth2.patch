@@ -1,0 +1,29 @@
+This patch modifies LibreOffice source files covered by the Mozilla Public
+License, v. 2.0 and is itself licensed under MPL 2.0. See the LICENSE file in
+this directory or https://www.mozilla.org/MPL/2.0/ for the license text.
+
+# uui's OAuth2 interaction handler (uui/source/iahndl-oauth2-win.cxx) is Windows-only
+# and the only uui curl consumer. Upstream defines OAUTH2REQUEST_SUPPORTED on every
+# Windows build because curl is always enabled there; with --disable-curl the handler
+# object is omitted (see the shared minimized-packaging patch), so the define must go
+# too or iahndl-authentication.cxx references an OAuth2Request that is never linked.
+# Authentication then falls back to the manual-code dialog, like on other platforms.
+--- a/config_host/config_oauth2.h.in
++++ b/config_host/config_oauth2.h.in
+@@ -13,6 +13,8 @@
+ #ifndef CONFIG_OAUTH2_H
+ #define CONFIG_OAUTH2_H
+ 
++#include <config_features.h>
++
+ /* 49152..65535 is ephemeral port number range recommended by IANA */
+ #define OAUTH2_REDIRECT_URI_PREFIX "http://localhost:49153/LibreOffice/oauth2/"
+ 
+@@ -46,6 +48,6 @@
+ #define ONEDRIVE_SCOPE "Files.ReadWrite offline_access"
+ 
+-#if defined _WIN32
++#if defined _WIN32 && HAVE_FEATURE_CURL
+ #define OAUTH2REQUEST_SUPPORTED
+ #endif
+ 
